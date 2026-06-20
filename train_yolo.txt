@@ -1,0 +1,19 @@
+from ultralytics import YOLO
+
+def main():
+
+    model = YOLO(
+        r"C:\Users\chank\Desktop\yolo_vol1.pt"
+    )
+
+    model.train(
+        data=r"C:\Users\chank\Desktop\dataset_new\data.yaml",
+        epochs=30,
+        imgsz=640,
+        batch=2,
+        device=0,
+        workers=0
+    )
+
+if __name__ == "__main__":
+    main()

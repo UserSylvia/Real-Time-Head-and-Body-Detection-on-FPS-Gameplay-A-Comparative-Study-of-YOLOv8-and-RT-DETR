@@ -1,0 +1,562 @@
+import os
+import cv2
+import math
+import shutil
+import argparse
+from pathlib import Path
+
+import numpy as np
+
+
+# =========================
+# 安全路徑處理
+# =========================
+
+def normalize_path(path: Path) -> Path:
+    return path.expanduser().resolve()
+
+
+def dangerous_paths() -> set[Path]:
+    home = normalize_path(Path.home())
+    return {
+        home,
+        normalize_path(home / "Desktop"),
+        normalize_path(home / "Documents"),
+        normalize_path(home / "Downloads"),
+        normalize_path(home / "Pictures"),
+    }
+
+
+def is_dangerous_dir(path: Path) -> bool:
+    return normalize_path(path) in dangerous_paths()
+
+
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def safe_prepare_output_dir(path: Path):
+    """
+    只清空輸出資料夾內容，不刪資料夾本身。
+    禁止直接對 Desktop / Documents / Home 做操作。
+    """
+    path = normalize_path(path)
+
+    if is_dangerous_dir(path):
+        raise RuntimeError(
+            f"拒絕使用危險輸出資料夾：{path}\n"
+            f"請改用子資料夾，例如：{path / 'game_frames_output'}"
+        )
+
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
+
+    for child in path.iterdir():
+        if child.is_file() or child.is_symlink():
+            child.unlink()
+        elif child.is_dir():
+            shutil.rmtree(child)
+
+
+# =========================
+# 基本影像分數
+# =========================
+
+def blur_score(gray: np.ndarray) -> float:
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def brightness_score(gray: np.ndarray) -> float:
+    return float(np.mean(gray))
+
+
+def contrast_score(gray: np.ndarray) -> float:
+    return float(np.std(gray))
+
+
+def edge_density(gray: np.ndarray) -> float:
+    edges = cv2.Canny(gray, 80, 160)
+    return float(np.mean(edges > 0))
+
+
+def crop_region(gray: np.ndarray, x1: float, x2: float, y1: float, y2: float) -> np.ndarray:
+    h, w = gray.shape[:2]
+    xa, xb = int(w * x1), int(w * x2)
+    ya, yb = int(h * y1), int(h * y2)
+    if xb <= xa or yb <= ya:
+        return gray
+    return gray[ya:yb, xa:xb]
+
+
+def crop_center(gray: np.ndarray) -> np.ndarray:
+    return crop_region(gray, 0.28, 0.72, 0.18, 0.82)
+
+
+def crop_focus(gray: np.ndarray) -> np.ndarray:
+    """
+    更小的中央焦點區域，偏向角色常出現的位置。
+    """
+    return crop_region(gray, 0.36, 0.64, 0.22, 0.78)
+
+
+def perceptual_feature(img: np.ndarray, size=(32, 32)) -> np.ndarray:
+    small = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    feat = gray.reshape(-1)
+    feat -= feat.mean()
+    feat /= (np.linalg.norm(feat) + 1e-8)
+    return feat
+
+
+def region_feature(gray_region: np.ndarray, size=(24, 24)) -> np.ndarray:
+    small = cv2.resize(gray_region, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    feat = small.reshape(-1)
+    feat -= feat.mean()
+    feat /= (np.linalg.norm(feat) + 1e-8)
+    return feat
+
+
+def color_feature(img: np.ndarray, bins=(8, 8, 8)) -> np.ndarray:
+    """
+    用色彩直方圖補強，避免亮度接近但內容不同的畫面被誤判。
+    """
+    hist = cv2.calcHist([img], [0, 1, 2], None, bins, [0, 256, 0, 256, 0, 256])
+    hist = hist.astype(np.float32).reshape(-1)
+    hist /= (np.linalg.norm(hist) + 1e-8)
+    return hist
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.dot(a, b))
+
+
+# =========================
+# 遊戲角色優先分數
+# =========================
+
+def central_structure_score(gray: np.ndarray) -> float:
+    """
+    偏好中央區域細節較多的畫面。
+    """
+    center = crop_center(gray)
+    focus = crop_focus(gray)
+
+    c_blur = blur_score(center)
+    c_contrast = contrast_score(center)
+    c_edges = edge_density(center)
+
+    f_blur = blur_score(focus)
+    f_contrast = contrast_score(focus)
+    f_edges = edge_density(focus)
+
+    score = (
+        math.log1p(max(c_blur, 0.0)) * 0.18
+        + (c_contrast / 32.0) * 0.20
+        + c_edges * 4.0 * 0.18
+        + math.log1p(max(f_blur, 0.0)) * 0.16
+        + (f_contrast / 32.0) * 0.14
+        + f_edges * 5.5 * 0.14
+    )
+    return float(score)
+
+
+def motion_map_score(curr_small: np.ndarray, prev_small: np.ndarray | None) -> tuple[float, float]:
+    """
+    和前一幀相比的動作量：
+    - overall_motion: 全畫面
+    - center_motion: 中央區域
+    """
+    if prev_small is None:
+        return 0.0, 0.0
+
+    diff = cv2.absdiff(curr_small, prev_small)
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+    _, th = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+
+    overall_motion = float(np.mean(th > 0))
+
+    h, w = th.shape[:2]
+    center = th[int(h * 0.20):int(h * 0.85), int(w * 0.25):int(w * 0.75)]
+    center_motion = float(np.mean(center > 0)) if center.size else 0.0
+
+    return overall_motion, center_motion
+
+
+def focus_motion_score(curr_small: np.ndarray, prev_small: np.ndarray | None) -> float:
+    """
+    偏向更小焦點區域的動作量。
+    """
+    if prev_small is None:
+        return 0.0
+
+    diff = cv2.absdiff(curr_small, prev_small)
+    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+    _, th = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY)
+
+    h, w = th.shape[:2]
+    focus = th[int(h * 0.22):int(h * 0.78), int(w * 0.36):int(w * 0.64)]
+    return float(np.mean(focus > 0)) if focus.size else 0.0
+
+
+def brightness_balance(gray: np.ndarray) -> float:
+    b = brightness_score(gray)
+    return max(0.0, 1.0 - abs(b - 128.0) / 128.0)
+
+
+def compute_game_priority_score(record: dict) -> float:
+    """
+    遊戲角色優先綜合分數：
+    - 中央結構資訊最重要
+    - 中央與焦點動作其次
+    - 清晰度、對比、邊緣量輔助
+    """
+    blur_term = math.log1p(max(record["blur"], 0.0))
+    contrast_term = record["contrast"] / 32.0
+    edge_term = record["edges"] * 6.0
+    central_term = record["central_structure_score"]
+    center_motion_term = record["center_motion"] * 9.0
+    focus_motion_term = record["focus_motion"] * 11.0
+    light_term = record["light_balance"] * 1.2
+
+    score = (
+        central_term * 0.34
+        + center_motion_term * 0.20
+        + focus_motion_term * 0.18
+        + blur_term * 0.12
+        + contrast_term * 0.07
+        + edge_term * 0.05
+        + light_term * 0.04
+    )
+    return float(score)
+
+
+# =========================
+# 候選幀讀取
+# =========================
+
+def choose_sampling_stride(total_frames: int, target_candidates: int = 6000) -> int:
+    if total_frames <= 0:
+        return 1
+    return max(1, total_frames // target_candidates)
+
+
+def read_candidates(video_path: Path):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"無法開啟影片：{video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    duration_sec = total_frames / fps if fps > 0 else 0.0
+    stride = choose_sampling_stride(total_frames, target_candidates=6000)
+
+    print(f"[INFO] total_frames={total_frames}, fps={fps:.3f}, duration={duration_sec:.2f}s, stride={stride}")
+
+    candidates = []
+    frame_idx = 0
+    prev_small = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % stride != 0:
+            frame_idx += 1
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small_gray = cv2.resize(gray, (320, 180), interpolation=cv2.INTER_AREA)
+
+        overall_motion, center_motion = motion_map_score(small_gray, prev_small)
+        focus_motion = focus_motion_score(small_gray, prev_small)
+
+        record = {
+            "frame_idx": frame_idx,
+            "timestamp": frame_idx / fps if fps > 0 else 0.0,
+            "image": frame,
+            "blur": blur_score(gray),
+            "brightness": brightness_score(gray),
+            "contrast": contrast_score(gray),
+            "edges": edge_density(gray),
+            "light_balance": brightness_balance(crop_center(gray)),
+            "central_structure_score": central_structure_score(gray),
+            "overall_motion": overall_motion,
+            "center_motion": center_motion,
+            "focus_motion": focus_motion,
+            "feat": perceptual_feature(frame),
+            "center_feat": region_feature(crop_center(gray)),
+            "focus_feat": region_feature(crop_focus(gray)),
+            "color_feat": color_feature(frame),
+        }
+
+        record["score"] = compute_game_priority_score(record)
+        candidates.append(record)
+
+        if len(candidates) % 100 == 0:
+            print(f"[INFO] 已分析候選幀 {len(candidates)}")
+
+        prev_small = small_gray
+        frame_idx += 1
+
+    cap.release()
+    return candidates
+
+
+# =========================
+# 品質過濾
+# =========================
+
+def quality_filter(records,
+                   min_blur=18.0,
+                   min_brightness=12.0,
+                   max_brightness=245.0,
+                   min_contrast=10.0):
+    out = []
+    for r in records:
+        if r["blur"] < min_blur:
+            continue
+        if r["brightness"] < min_brightness or r["brightness"] > max_brightness:
+            continue
+        if r["contrast"] < min_contrast:
+            continue
+        out.append(r)
+    return out
+
+
+# =========================
+# 真正減少類似畫面
+# =========================
+
+def is_near_duplicate(candidate,
+                      selected_pool,
+                      global_sim=0.992,
+                      center_sim=0.990,
+                      focus_sim=0.989,
+                      color_sim=0.996,
+                      time_gap_bias=0.35):
+    """
+    多重條件去重：
+    - 全圖很像
+    - 中央很像
+    - 焦點區域很像
+    - 顏色分布也接近
+    - 時間很近時更容易當作重複
+    """
+    for s in selected_pool:
+        sim_global = cosine_similarity(candidate["feat"], s["feat"])
+        if sim_global < global_sim:
+            continue
+
+        sim_center = cosine_similarity(candidate["center_feat"], s["center_feat"])
+        if sim_center < center_sim:
+            continue
+
+        sim_focus = cosine_similarity(candidate["focus_feat"], s["focus_feat"])
+        if sim_focus < focus_sim:
+            continue
+
+        sim_color = cosine_similarity(candidate["color_feat"], s["color_feat"])
+        if sim_color < color_sim:
+            continue
+
+        # 很接近的時間點，用更寬鬆條件視為重複
+        if abs(candidate["timestamp"] - s["timestamp"]) < time_gap_bias:
+            return True
+
+        # 即便時間差較大，但內容超級像，也視為重複
+        if sim_global > 0.996 and sim_center > 0.995 and sim_focus > 0.994:
+            return True
+
+    return False
+
+
+def deduplicate(records,
+                global_sim=0.992,
+                center_sim=0.990,
+                focus_sim=0.989,
+                color_sim=0.996,
+                max_compare_recent=180):
+    """
+    按分數高到低挑圖，只跟最近已選的一部分比較，兼顧速度。
+    """
+    records = sorted(records, key=lambda x: x["score"], reverse=True)
+
+    selected = []
+    for r in records:
+        pool = selected[-max_compare_recent:] if len(selected) > max_compare_recent else selected
+        if not is_near_duplicate(
+            r,
+            pool,
+            global_sim=global_sim,
+            center_sim=center_sim,
+            focus_sim=focus_sim,
+            color_sim=color_sim
+        ):
+            selected.append(r)
+    return selected
+
+
+# =========================
+# 兼顧時間分布
+# =========================
+
+def select_evenly_across_timeline(records, target=500):
+    """
+    避免全部集中在某幾秒。
+    把整段時間切成 target 個桶，每桶選分數最高者。
+    """
+    if len(records) <= target:
+        return sorted(records, key=lambda x: x["timestamp"])
+
+    items = sorted(records, key=lambda x: x["timestamp"])
+    start_t = items[0]["timestamp"]
+    end_t = items[-1]["timestamp"]
+    total_span = max(1e-6, end_t - start_t)
+
+    buckets = [[] for _ in range(target)]
+    for r in items:
+        pos = (r["timestamp"] - start_t) / total_span
+        idx = min(target - 1, int(pos * target))
+        buckets[idx].append(r)
+
+    selected = []
+    selected_ids = set()
+
+    for bucket in buckets:
+        if bucket:
+            best = max(bucket, key=lambda x: x["score"])
+            selected.append(best)
+            selected_ids.add(id(best))
+
+    if len(selected) < target:
+        remain = [r for r in sorted(items, key=lambda x: x["score"], reverse=True) if id(r) not in selected_ids]
+        selected.extend(remain[:target - len(selected)])
+
+    if len(selected) > target:
+        selected = sorted(selected, key=lambda x: x["score"], reverse=True)[:target]
+
+    return sorted(selected, key=lambda x: x["score"], reverse=True)
+
+
+# =========================
+# 輸出
+# =========================
+
+def save_selected(records, output_dir: Path):
+    safe_prepare_output_dir(output_dir)
+
+    manifest = output_dir / "_manifest.csv"
+    with open(manifest, "w", encoding="utf-8") as f:
+        f.write(
+            "new_name,frame_idx,timestamp,score,central_structure_score,center_motion,focus_motion,"
+            "blur,brightness,contrast,edges\n"
+        )
+
+        for i, r in enumerate(records, start=1):
+            filename = f"{i:03d}.jpg"
+            outpath = output_dir / filename
+
+            ok, buf = cv2.imencode(".jpg", r["image"], [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if not ok:
+                raise RuntimeError(f"寫入失敗：{outpath}")
+            buf.tofile(str(outpath))
+
+            f.write(
+                f"{filename},{r['frame_idx']},{r['timestamp']:.3f},{r['score']:.6f},"
+                f"{r['central_structure_score']:.6f},{r['center_motion']:.6f},{r['focus_motion']:.6f},"
+                f"{r['blur']:.4f},{r['brightness']:.4f},{r['contrast']:.4f},{r['edges']:.6f}\n"
+            )
+
+
+# =========================
+# 主流程
+# =========================
+
+def main():
+    parser = argparse.ArgumentParser(description="遊戲角色優先 + 類似畫面減少的影片截圖工具")
+    parser.add_argument("--input", required=True, help="本機影片路徑")
+    parser.add_argument("--output-dir", required=True, help="輸出資料夾（請用子資料夾，不要直接用 Desktop）")
+    parser.add_argument("--target", type=int, default=500, help="目標張數")
+    parser.add_argument("--min-blur", type=float, default=18.0)
+    parser.add_argument("--min-brightness", type=float, default=12.0)
+    parser.add_argument("--max-brightness", type=float, default=245.0)
+    parser.add_argument("--min-contrast", type=float, default=10.0)
+
+    parser.add_argument("--global-sim", type=float, default=0.992)
+    parser.add_argument("--center-sim", type=float, default=0.990)
+    parser.add_argument("--focus-sim", type=float, default=0.989)
+    parser.add_argument("--color-sim", type=float, default=0.996)
+
+    args = parser.parse_args()
+
+    video_path = normalize_path(Path(args.input))
+    output_dir = normalize_path(Path(args.output_dir))
+
+    if not video_path.exists():
+        raise FileNotFoundError(f"找不到影片：{video_path}")
+
+    if is_dangerous_dir(output_dir):
+        raise RuntimeError(
+            f"output-dir 不能直接設成危險路徑：{output_dir}\n"
+            f"請改成子資料夾，例如：{output_dir / 'game_frames_output'}"
+        )
+
+    print("[INFO] 讀取候選幀...")
+    records = read_candidates(video_path)
+    print(f"[INFO] 候選幀數量：{len(records)}")
+
+    print("[INFO] 品質過濾...")
+    filtered = quality_filter(
+        records,
+        min_blur=args.min_blur,
+        min_brightness=args.min_brightness,
+        max_brightness=args.max_brightness,
+        min_contrast=args.min_contrast
+    )
+    print(f"[INFO] 品質過濾後：{len(filtered)}")
+
+    base = filtered if len(filtered) >= args.target else records
+
+    print("[INFO] 去除類似畫面...")
+    deduped = deduplicate(
+        base,
+        global_sim=args.global_sim,
+        center_sim=args.center_sim,
+        focus_sim=args.focus_sim,
+        color_sim=args.color_sim
+    )
+    print(f"[INFO] 去重後：{len(deduped)}")
+
+    if len(deduped) < args.target:
+        print("[WARN] 去重後不足目標數，放寬一次門檻...")
+        deduped = deduplicate(
+            base,
+            global_sim=min(0.996, args.global_sim + 0.002),
+            center_sim=min(0.994, args.center_sim + 0.002),
+            focus_sim=min(0.993, args.focus_sim + 0.002),
+            color_sim=min(0.998, args.color_sim + 0.001)
+        )
+        print(f"[INFO] 放寬後：{len(deduped)}")
+
+    print("[INFO] 兼顧時間分布挑選最終結果...")
+    final_records = select_evenly_across_timeline(deduped, target=args.target)
+
+    if len(final_records) < args.target:
+        used = {id(x) for x in final_records}
+        remain = [r for r in sorted(base, key=lambda x: x["score"], reverse=True) if id(r) not in used]
+        final_records.extend(remain[:args.target - len(final_records)])
+
+    final_records = final_records[:args.target]
+    final_records.sort(key=lambda x: x["score"], reverse=True)
+
+    print("[INFO] 輸出圖片...")
+    save_selected(final_records, output_dir)
+
+    print("[DONE] 完成")
+    print(f"[DONE] 已輸出 {len(final_records)} 張到：{output_dir}")
+
+
+if __name__ == "__main__":
+    main()

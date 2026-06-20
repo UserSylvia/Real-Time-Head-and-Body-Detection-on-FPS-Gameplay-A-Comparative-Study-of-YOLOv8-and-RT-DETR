@@ -1,0 +1,10 @@
+# data.yaml
+
+path: C:/Users/chank/Desktop/dataset
+
+train: images/train
+val: images/val
+
+names:
+  0: head
+  1: body

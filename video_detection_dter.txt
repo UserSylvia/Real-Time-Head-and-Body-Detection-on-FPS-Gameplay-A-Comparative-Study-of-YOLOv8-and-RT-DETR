@@ -1,0 +1,197 @@
+import cv2
+import time
+
+from ultralytics import RTDETR
+
+# =========================
+# 模型與影片路徑
+# =========================
+
+MODEL_PATH = r"C:\Users\chank\Desktop\訓練模型\yolo_vol2.pt"
+
+VIDEO_PATH = r"C:\Users\chank\Desktop\擊殺精華.mp4"
+
+OUTPUT_PATH = r"C:\Users\chank\Desktop\偵測影片\detection_output_yolo_vol2.avi"
+
+# =========================
+# 類別名稱
+# =========================
+
+CLASS_NAMES = {
+    0: "head",
+    1: "body"
+}
+
+# =========================
+# 不同類別顏色
+# BGR 格式
+# =========================
+
+CLASS_COLORS = {
+    0: (0, 0, 255),    # head -> 紅色
+    1: (0, 255, 0)     # body -> 綠色
+}
+
+CONF_THRESHOLD = 0.25
+
+# =========================
+# 載入 RT-DETR 模型
+# =========================
+
+model = RTDETR(MODEL_PATH)
+model.to("cuda")
+
+# =========================
+# 開啟影片
+# =========================
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+if not cap.isOpened():
+    print("無法開啟影片")
+    exit()
+
+# =========================
+# 取得影片資訊
+# =========================
+
+fps_video = cap.get(cv2.CAP_PROP_FPS)
+width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+if fps_video == 0 or fps_video != fps_video:
+    fps_video = 30
+
+print("影片 FPS:", fps_video)
+print("影片尺寸:", width, height)
+
+# =========================
+# 建立輸出影片
+# =========================
+
+fourcc = cv2.VideoWriter_fourcc(*"XVID")
+
+out = cv2.VideoWriter(
+    OUTPUT_PATH,
+    fourcc,
+    fps_video,
+    (width, height)
+)
+
+if not out.isOpened():
+    print("輸出影片建立失敗，請檢查路徑或編碼器")
+    cap.release()
+    exit()
+
+WINDOW_NAME = "RT-DETR Video Detection"
+cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+
+prev_time = time.time()
+
+print("Press ESC to exit.")
+
+# =========================
+# 主迴圈
+# =========================
+
+while True:
+    ret, frame = cap.read()
+
+    if not ret:
+        print("影片結束")
+        break
+
+    # =========================
+    # RT-DETR 偵測
+    # =========================
+
+    results = model.predict(
+        source=frame,
+        conf=CONF_THRESHOLD,
+        imgsz=640,
+        device=0,
+        verbose=False
+    )
+
+    result = results[0]
+
+    # =========================
+    # 畫 bounding boxes
+    # =========================
+
+    for box in result.boxes:
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        conf = float(box.conf[0])
+        cls_id = int(box.cls[0])
+
+        class_name = CLASS_NAMES.get(cls_id, str(cls_id))
+        label = f"{class_name} {conf:.2f}"
+        color = CLASS_COLORS.get(cls_id, (255, 255, 255))
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+        text_size, _ = cv2.getTextSize(
+            label,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            2
+        )
+
+        text_w, text_h = text_size
+
+        cv2.rectangle(
+            frame,
+            (x1, y1 - text_h - 10),
+            (x1 + text_w + 10, y1),
+            color,
+            -1
+        )
+
+        cv2.putText(
+            frame,
+            label,
+            (x1 + 5, y1 - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2
+        )
+
+    # =========================
+    # FPS
+    # =========================
+
+    current_time = time.time()
+    fps = 1 / (current_time - prev_time)
+    prev_time = current_time
+
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.1f}",
+        (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0, 255, 255),
+        2
+    )
+
+    # 寫入輸出影片
+    out.write(frame)
+
+    # 顯示畫面
+    cv2.imshow(WINDOW_NAME, frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        print("手動結束，正在儲存影片")
+        break
+
+# =========================
+# 關閉資源
+# =========================
+
+cap.release()
+out.release()
+cv2.destroyAllWindows()
+
+print(f"輸出影片已儲存：{OUTPUT_PATH}")
